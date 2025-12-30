@@ -1,0 +1,184 @@
+# Kubernetes Deployment for Travel ML API
+# Deploy using: kubectl apply -f deployment.yaml
+
+---
+# Namespace
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: travel-ml
+  labels:
+    app: travel-ml
+
+---
+# ConfigMap for environment variables
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: travel-ml-config
+  namespace: travel-ml
+data:
+  FLASK_ENV: "production"
+  PYTHONUNBUFFERED: "1"
+  API_VERSION: "1.0.0"
+
+---
+# Secret for sensitive data
+apiVersion: v1
+kind: Secret
+metadata:
+  name: travel-ml-secrets
+  namespace: travel-ml
+type: Opaque
+data:
+  # Base64 encoded values (use: echo -n 'value' | base64)
+  SECRET_KEY: c2VjcmV0LWtleS1oZXJl
+
+---
+# PersistentVolumeClaim for models
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: models-pvc
+  namespace: travel-ml
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+
+---
+# Deployment for ML API
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: travel-ml-api
+  namespace: travel-ml
+  labels:
+    app: travel-ml-api
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: travel-ml-api
+  template:
+    metadata:
+      labels:
+        app: travel-ml-api
+    spec:
+      containers:
+        - name: travel-ml-api
+          image: travel-ml-api:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 5000
+              name: http
+          envFrom:
+            - configMapRef:
+                name: travel-ml-config
+          env:
+            - name: SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: travel-ml-secrets
+                  key: SECRET_KEY
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "250m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          volumeMounts:
+            - name: models-storage
+              mountPath: /app/models
+      volumes:
+        - name: models-storage
+          persistentVolumeClaim:
+            claimName: models-pvc
+
+---
+# Service for ML API
+apiVersion: v1
+kind: Service
+metadata:
+  name: travel-ml-api-service
+  namespace: travel-ml
+  labels:
+    app: travel-ml-api
+spec:
+  type: LoadBalancer
+  ports:
+    - port: 80
+      targetPort: 5000
+      protocol: TCP
+      name: http
+  selector:
+    app: travel-ml-api
+
+---
+# HorizontalPodAutoscaler
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: travel-ml-api-hpa
+  namespace: travel-ml
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: travel-ml-api
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+
+---
+# Ingress (optional - for domain routing)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: travel-ml-ingress
+  namespace: travel-ml
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+spec:
+  rules:
+    - host: travel-ml.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: travel-ml-api-service
+                port:
+                  number: 80

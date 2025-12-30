@@ -1,0 +1,114 @@
+version: '3.8'
+
+services:
+  # Main ML API Service
+  ml-api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: travel-ml-api
+    ports:
+      - "5000:5000"
+    environment:
+      - FLASK_ENV=development
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ../models:/app/models
+      - ../data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - travel-network
+
+  # MLFlow Tracking Server
+  mlflow:
+    image: python:3.10-slim
+    container_name: mlflow-server
+    command: >
+      bash -c "pip install mlflow && 
+               mlflow server --host 0.0.0.0 --port 5001 
+               --backend-store-uri sqlite:///mlflow.db 
+               --default-artifact-root /mlruns"
+    ports:
+      - "5001:5001"
+    volumes:
+      - mlflow-data:/mlruns
+      - mlflow-db:/app
+    networks:
+      - travel-network
+
+  # Streamlit Dashboard
+  streamlit:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.streamlit
+    container_name: travel-dashboard
+    ports:
+      - "8501:8501"
+    environment:
+      - API_URL=http://ml-api:5000
+    depends_on:
+      - ml-api
+    volumes:
+      - ../streamlit:/app/streamlit
+      - ../data:/app/data
+    networks:
+      - travel-network
+
+  # Airflow (for workflow automation)
+  airflow-webserver:
+    image: apache/airflow:2.7.3-python3.10
+    container_name: airflow-webserver
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=sqlite:////opt/airflow/airflow.db
+      - AIRFLOW__CORE__FERNET_KEY=your-fernet-key-here
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+      - AIRFLOW__WEBSERVER__SECRET_KEY=your-secret-key
+    ports:
+      - "8080:8080"
+    volumes:
+      - ../airflow/dags:/opt/airflow/dags
+      - airflow-logs:/opt/airflow/logs
+    command: >
+      bash -c "airflow db init && 
+               airflow users create --username admin --password admin 
+               --firstname Admin --lastname User --role Admin --email admin@example.com &&
+               airflow webserver"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - travel-network
+
+  airflow-scheduler:
+    image: apache/airflow:2.7.3-python3.10
+    container_name: airflow-scheduler
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=sqlite:////opt/airflow/airflow.db
+      - AIRFLOW__CORE__FERNET_KEY=your-fernet-key-here
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+    volumes:
+      - ../airflow/dags:/opt/airflow/dags
+      - airflow-logs:/opt/airflow/logs
+    command: airflow scheduler
+    depends_on:
+      - airflow-webserver
+    networks:
+      - travel-network
+
+networks:
+  travel-network:
+    driver: bridge
+
+volumes:
+  mlflow-data:
+  mlflow-db:
+  airflow-logs:

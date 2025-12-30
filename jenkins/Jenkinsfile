@@ -1,0 +1,331 @@
+// Jenkinsfile for Travel ML CI/CD Pipeline
+// This pipeline builds, tests, and deploys the Travel ML application
+
+pipeline {
+    agent any
+    
+    environment {
+        DOCKER_REGISTRY = 'your-registry.com'
+        IMAGE_NAME = 'travel-ml-api'
+        IMAGE_TAG = "${env.BUILD_NUMBER}"
+        KUBECONFIG = credentials('kubeconfig')
+        MLFLOW_TRACKING_URI = 'http://mlflow:5001'
+    }
+    
+    options {
+        timestamps()
+        timeout(time: 1, unit: 'HOURS')
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                echo '📥 Checking out code...'
+                checkout scm
+                
+                script {
+                    env.GIT_COMMIT_SHORT = sh(
+                        script: "git rev-parse --short HEAD",
+                        returnStdout: true
+                    ).trim()
+                }
+            }
+        }
+        
+        stage('Setup Environment') {
+            steps {
+                echo '🔧 Setting up Python environment...'
+                sh '''
+                    python3 -m venv venv
+                    . venv/bin/activate
+                    pip install --upgrade pip
+                    pip install -r requirements.txt
+                '''
+            }
+        }
+        
+        stage('Lint & Code Quality') {
+            steps {
+                echo '🔍 Running code quality checks...'
+                sh '''
+                    . venv/bin/activate
+                    pip install flake8 black isort
+                    
+                    # Linting
+                    flake8 models/ api/ --max-line-length=120 --ignore=E501,W503 || true
+                    
+                    # Format check
+                    black --check models/ api/ || true
+                    
+                    # Import sorting check
+                    isort --check-only models/ api/ || true
+                '''
+            }
+        }
+        
+        stage('Unit Tests') {
+            steps {
+                echo '🧪 Running unit tests...'
+                sh '''
+                    . venv/bin/activate
+                    pip install pytest pytest-cov pytest-html
+                    
+                    pytest tests/ \
+                        --cov=models \
+                        --cov=api \
+                        --cov-report=xml:coverage.xml \
+                        --cov-report=html:htmlcov \
+                        --junitxml=test-results.xml \
+                        -v
+                '''
+            }
+            post {
+                always {
+                    junit 'test-results.xml'
+                    publishHTML([
+                        allowMissing: false,
+                        alwaysLinkToLastBuild: true,
+                        keepAll: true,
+                        reportDir: 'htmlcov',
+                        reportFiles: 'index.html',
+                        reportName: 'Coverage Report'
+                    ])
+                }
+            }
+        }
+        
+        stage('Train Models') {
+            steps {
+                echo '🎯 Training ML models...'
+                sh '''
+                    . venv/bin/activate
+                    
+                    # Train flight price model
+                    cd models
+                    python flight_price_model.py
+                    
+                    # Train gender classifier
+                    python gender_classifier.py
+                    
+                    # Train hotel recommender
+                    python hotel_recommender.py
+                    
+                    cd ..
+                '''
+            }
+        }
+        
+        stage('Model Validation') {
+            steps {
+                echo '✅ Validating model performance...'
+                sh '''
+                    . venv/bin/activate
+                    python -c "
+import joblib
+import numpy as np
+
+# Load and validate flight model
+flight_model = joblib.load('models/flight_price_model.pkl')
+assert flight_model['model'] is not None, 'Flight model not trained'
+print('✅ Flight price model validated')
+
+# Load and validate gender classifier
+gender_model = joblib.load('models/gender_classifier.pkl')
+assert gender_model['model'] is not None, 'Gender model not trained'
+print('✅ Gender classifier validated')
+
+# Load and validate recommender
+hotel_model = joblib.load('models/hotel_recommender.pkl')
+assert hotel_model['nn_model'] is not None, 'Hotel recommender not trained'
+print('✅ Hotel recommender validated')
+
+print('✅ All models validated successfully!')
+"
+                '''
+            }
+        }
+        
+        stage('Build Docker Image') {
+            steps {
+                echo '🐳 Building Docker image...'
+                sh '''
+                    docker build \
+                        -t ${DOCKER_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG} \
+                        -t ${DOCKER_REGISTRY}/${IMAGE_NAME}:latest \
+                        -f docker/Dockerfile .
+                '''
+            }
+        }
+        
+        stage('Security Scan') {
+            steps {
+                echo '🔒 Running security scan...'
+                sh '''
+                    # Trivy scan for vulnerabilities
+                    docker run --rm \
+                        -v /var/run/docker.sock:/var/run/docker.sock \
+                        aquasec/trivy image \
+                        --severity HIGH,CRITICAL \
+                        --exit-code 0 \
+                        ${DOCKER_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG} || true
+                '''
+            }
+        }
+        
+        stage('Integration Tests') {
+            steps {
+                echo '🔗 Running integration tests...'
+                sh '''
+                    # Start container for testing
+                    docker run -d \
+                        --name test-api \
+                        -p 5001:5000 \
+                        ${DOCKER_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}
+                    
+                    # Wait for startup
+                    sleep 10
+                    
+                    # Health check
+                    curl -f http://localhost:5001/health || exit 1
+                    
+                    # Test flight prediction endpoint
+                    curl -X POST http://localhost:5001/api/v1/predict/flight-price \
+                        -H "Content-Type: application/json" \
+                        -d '{"from":"New York","to":"Miami","flightType":"economy","distance":1500}' \
+                        || exit 1
+                    
+                    # Cleanup
+                    docker stop test-api
+                    docker rm test-api
+                    
+                    echo '✅ Integration tests passed!'
+                '''
+            }
+        }
+        
+        stage('Push to Registry') {
+            when {
+                branch 'main'
+            }
+            steps {
+                echo '📤 Pushing to Docker registry...'
+                withCredentials([usernamePassword(
+                    credentialsId: 'docker-registry-creds',
+                    usernameVariable: 'DOCKER_USER',
+                    passwordVariable: 'DOCKER_PASS'
+                )]) {
+                    sh '''
+                        echo $DOCKER_PASS | docker login ${DOCKER_REGISTRY} -u $DOCKER_USER --password-stdin
+                        docker push ${DOCKER_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}
+                        docker push ${DOCKER_REGISTRY}/${IMAGE_NAME}:latest
+                    '''
+                }
+            }
+        }
+        
+        stage('Deploy to Staging') {
+            when {
+                branch 'main'
+            }
+            steps {
+                echo '🚀 Deploying to staging...'
+                sh '''
+                    # Update Kubernetes deployment
+                    kubectl --kubeconfig=${KUBECONFIG} \
+                        set image deployment/travel-ml-api \
+                        travel-ml-api=${DOCKER_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG} \
+                        -n travel-ml-staging
+                    
+                    # Wait for rollout
+                    kubectl --kubeconfig=${KUBECONFIG} \
+                        rollout status deployment/travel-ml-api \
+                        -n travel-ml-staging \
+                        --timeout=300s
+                '''
+            }
+        }
+        
+        stage('Deploy to Production') {
+            when {
+                branch 'main'
+            }
+            input {
+                message "Deploy to production?"
+                ok "Deploy"
+                parameters {
+                    booleanParam(name: 'CONFIRM', defaultValue: false, description: 'Confirm production deployment')
+                }
+            }
+            steps {
+                echo '🚀 Deploying to production...'
+                sh '''
+                    kubectl --kubeconfig=${KUBECONFIG} \
+                        set image deployment/travel-ml-api \
+                        travel-ml-api=${DOCKER_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG} \
+                        -n travel-ml
+                    
+                    kubectl --kubeconfig=${KUBECONFIG} \
+                        rollout status deployment/travel-ml-api \
+                        -n travel-ml \
+                        --timeout=300s
+                '''
+            }
+        }
+        
+        stage('Log to MLflow') {
+            steps {
+                echo '📊 Logging to MLflow...'
+                sh '''
+                    . venv/bin/activate
+                    python -c "
+import mlflow
+import joblib
+import os
+
+mlflow.set_tracking_uri('${MLFLOW_TRACKING_URI}')
+mlflow.set_experiment('travel-ml-production')
+
+with mlflow.start_run(run_name='jenkins-build-${BUILD_NUMBER}'):
+    mlflow.log_param('build_number', '${BUILD_NUMBER}')
+    mlflow.log_param('git_commit', '${GIT_COMMIT_SHORT}')
+    mlflow.log_param('image_tag', '${IMAGE_TAG}')
+    
+    # Log models as artifacts
+    mlflow.log_artifacts('models/', artifact_path='models')
+    
+    print('✅ Logged to MLflow')
+"
+                '''
+            }
+        }
+    }
+    
+    post {
+        always {
+            echo '🧹 Cleaning up...'
+            sh '''
+                docker rmi ${DOCKER_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG} || true
+                rm -rf venv || true
+            '''
+            cleanWs()
+        }
+        success {
+            echo '✅ Pipeline completed successfully!'
+            slackSend(
+                channel: '#mlops-alerts',
+                color: 'good',
+                message: "✅ Travel ML Pipeline SUCCESS - Build #${BUILD_NUMBER}"
+            )
+        }
+        failure {
+            echo '❌ Pipeline failed!'
+            slackSend(
+                channel: '#mlops-alerts',
+                color: 'danger',
+                message: "❌ Travel ML Pipeline FAILED - Build #${BUILD_NUMBER}"
+            )
+        }
+    }
+}
